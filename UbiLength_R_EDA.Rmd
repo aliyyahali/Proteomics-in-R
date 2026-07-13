@@ -6,7 +6,7 @@ output: html_notebook
 This .Rmd contains UbiLength EDA analysis with notes, supported by a guided workthrough (Arne Smits - Introduction to DEP).
 UbiLength: an affinity enrichment dataset of ubiquitin interactors
 
-Load UbiLength proteomics LC-MS dataset
+Load UbiLength proteomics LC-MS dataset.
 
 ```{r}
 library(DEP)
