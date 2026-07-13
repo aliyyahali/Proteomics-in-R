@@ -1,0 +1,216 @@
+---
+title: "Proteomics dataset EDA"
+output: html_notebook
+---
+
+This .Rmd contains UbiLength EDA analysis with notes, supported by a guided workthrough (Arne Smits - Introduction to DEP).
+UbiLength: an affinity enrichment dataset of ubiquitin interactors
+
+Load UbiLength proteomics LC-MS dataset
+
+```{r}
+library(DEP)
+data("UbiLength")
+#affinity enrichment of ubiquitin interactors
+View(UbiLength)
+
+library(tidyverse)
+data <- UbiLength #dim = 3006,23
+
+# remove "potential contaminants"
+data <- filter(data, Reverse !="+", Potential.contaminant != "+") #dim = 2941,23
+
+colnames(data)
+# use LFQ.intensity columns for downstream analysis (label-free quantitation)
+```
+
+
+*Cleaning / normalising data*
+
+```{r}
+#duplicate genes?
+#my ver:
+u <- select(data, Gene.names) %>%
+  unique()
+dim(u)
+
+#example ver:
+data$Gene.names %>%
+  duplicated() %>%
+  any()
+# i.e. of subgroup data$Gene.name, do duplicates exist? T/F
+
+#exemplar table generated of unique Gene.names:
+data %>% group_by(Gene.names) %>% # take subgroup
+  summarise(frequency = n()) %>% #returns all samples(?)
+  arrange(desc(frequency)) %>% filter(frequency > 1) #rearrange Gene.names in descending order of frequency (duplicates)
+
+```
+
+Identified duplicate genes are present in high frequencies (e.g. ATXN2 = 7x)
+Rename each individual sample with "Gene.name;Protein.IDs":
+```{r}
+#exemplar:
+data_unique <- make_unique(data, "Gene.names", "Protein.IDs", delim = ";") #make_unique from DEP package, call data > call column names within one protein group (row) > join character strings with delimiter ==> creates 2 new columns: names, ids
+
+#confirm any duplicates left under new column 'names'?
+data_unique$name %>% duplicated() %>% any()
+
+```
+
+
+Create summarised experiment (unique protein > LFQ intensity):
+```{r}
+LFQ_columns <- grep("LFQ.", colnames(data_unique)) #grab all column names that start with "LFQ."
+head(LFQ_columns) #highlights relevant columns from column 9 onward
+data_se_parsed <- make_se_parse(data_unique, LFQ_columns) #stitch unique proteins + data from relevant LFQ columns (9-14) into data.frame
+#Assay data is automatically log2transformed. Listdata contains label, ID, replicates
+
+```
+
+Normalising dataset: some replicates in dataset are not quantified. Replicate = repeats; some return missing / NA / NaN values. Some only have data for one replicate (also extreme/unexpected) --> needs imputation (only if missing value are the minority, else risk false positive).
+For proteins with excess missing values, do not attempt to impute. Remove/filter these proteins by setting a threshold:
+```{r}
+data_filt <- filter_missval(data_se_parsed, thr = 0) #take summarisedExperiment data.frame, filter proteins with 0 missing values (for at least 1 condition)
+#each sample is replicated 3x (view data_uniqe; 3 LFQ intensity columns per condition)
+#- above is strict (allows no missing values, filters proteins with all 3 replicates containing no missing data);
+
+plot_numbers(data_filt) # barplot
+#average no. of proteins per sample dropped from ~1900 to ~1500
+
+plot_coverage(data_filt) #overlapping no. of proteins (?) across samples
+```
+
+For less strict filter: apply thr = 1 to allow max 1 missing value for any replicate
+i.e. there are 3 replicates/samples for each condition. under thr = 1: if 2/3 replicates/samples have values in at least 1 condition, keep the row (even if there are 0/3 recorded values for another condition)
+
+
+
+Normalise data via variance-stabilising transformation, to correct heavily skewed data. Variance independent of mean (vsn)
+```{r}
+data_norm <- normalize_vsn(data_filt)
+#corrected unequal variance?:
+plot_normalization(data_norm, data_filt)
+
+```
+Data distribution should be same/similar following normalisation.
+Variance stabilising normalisation (VSN) stabilises/corrects unequal variance caused by low-abundance proteins with low variance and high-abundance proteins with high variance. (log fold change will only amplify the high-abundance proteins, hence not suitable)
+
+Above data filtered under thr = 0: at least one condition must have 3/3 replicate/sample values.
+Are there missing values for 1< condition for a particular protein? plot heatmap:
+```{r}
+plot_missval(data_filt)
+```
+Heat map: missing values = 0; not missing = 1
+Based on the trend of missing/non-missing values, this could indicate if a protein was missing values at random (biological event) MAR, or errors from missing detection limit MNAR (not at random).
+
+
+
+Choose the correct imputation method based on heatmap pattern:
+1. There are missing values for several conditions: MAR?
+2. Missing the detection limit threshold: MNAR?
+3. .. therefore, are missing values biased to lower intensity proteins?:
+```{r}
+plot_detect(data_norm)
+#density graph: a high proportion of TRUE missing values derive from low-intensity values ==> MNAR
+#cmf graph: TRUE missing values at lower log fold intensities; FALSE missing value at higher intensities
+```
+High proportion of missing values at low intensities suggests below threshold limit ==> MNAR.
+MNAR values imputed via left-censored imputation (impute feasible/estimated low values past threshold limit)
+
+MNAR: quantile regression based left-censored function (QRILC), assess end tail of data (cut-off from limit threshold), apply linear regression with sampled data, fill end tail. In box plot, this would be reflected as end whisker (minimum value) uniform across all <LOD samples (bc used same sample to perform linear regression and predict missing <LOD values).
+MAR: kNN (k-nearest neighbour) / maximum likelihood estimate (MLE) assessing overall trend to impute low intensity values
+```{r}
+#select imputation method:
+#data_imp <- impute(data_norm, fun = "QRILC")
+data_imp <- impute(data_norm, fun = "MinProb", q = 0.01) # use lowest 1% percentile of collected data for random sampling > impute values
+
+plot_detect(data_imp)
+plot_missval(data_imp)
+#both return no missing values
+```
+
+```{r}
+plot_imputation(data_norm, data_imp)
+```
+
+
+
+
+*Differential Expression Analysis*
+
+```{r}
+library(limma)
+data_diff <- test_diff(data_imp, type = "control", control = "Ctrl_") # apply Bayes statistics to compare all samples against control (Ctrl_); i.e. is there a significant difference between control and each condition?
+
+data_diff_all_contrasts <- test_diff(data_imp, type = "all") # compare and contrast all sample combinations (*spider leg friction coefficient table), i.e. is there a significant difference *between each condition* in protein expression?
+
+
+
+
+```
+Error: run test_diff() with a valid control.
+Valid controls are: 'Ubi4_', 'Ubi6_', 'Ctrl_', 'Ubi1_'
+
+To identify the correct name/character string, use df$condition.
+
+
+(Each individual control replicate ("Ctrl__1", "Ctrl__2", "Ctrl__3") does not need to be specified. Use "Ctrl_" to group all 3 replicates for accurate df + sd + p-vals)
+
+This leaves (beta) coefficients for each condition's replicates:
+```{r}
+#determine significant p-values (from control)
+dep <- add_rejections(data_diff, alpha = 0.05, lfc = log2(1.5))
+
+```
+
+
+*Visualising the results*
+
+PCA plot uses hierarchical clustering to group similar proteins together based on qualities, i.e. protein expression LFQ intensity
+
+```{r}
+plot_pca(dep)
+#differences in x-axis is more significant than that of vertical y-axis difference
+```
+Ubi6 and Ubi4 are the most different in overall protein expression compared to Ctrl.
+Ubi1 is similar in protein expression to Ctrl (PCA1)
+#elliptic shape: wide length holds most variance (PCA1), short length has least variance (PCA2), therefore differences in PCA1 take precedence
+
+This is further supported by a Pearson correlation heatmap:
+```{r}
+plot_cor(dep, lower = 0, pal = "RdPu")
+#similar protein expression in Ubi6 and Ubi4 also reflected with a strong correlation in the heatmap
+#weaker correlation in Ubi1 to Ctrl (strong PCA2, weak PCA1 difference)
+```
+
+
+Log fold intensity (log2 intensity) represents absolute abundance of a protein / expression; dataset is normalised (based on that protein's expression average z-score). Log2 intensity used so that proteins with exponentially higher expression do not occlude the least expressed proteins.
+
+```{r}
+#hierachical clustering heatmap (easier to view protein expression patterns across conditions/replicates)
+plot_heatmap(dep, type = "centered", show_row_names = FALSE, col_limit= 4)
+
+# use kmeans = TRUE to group protein clusters of rows (specified no. with k = x)
+```
+#kmeans = FALSE uses hierarchical clustering: bottom-up approach joining 2 most similar proteins, then cluster with next pair of similar proteins etc...
+
+
+Log fold change lfc represents changes in protein expression from control (contrasts). Does not tell you by how much, only relative difference in expression.
+```{r}
+plot_heatmap(dep, type = "contrast", kmeans = TRUE, col_limit = 10, show_row_names = FALSE)
+```
+#kmeans = TRUE uses k-means clustering: define number of clusters with k = x, then centroids (each cluster's average) is chosen (distinct, least similar values to clearly define each cluster). Protein expression values most similar to a centroid will get regrouped. Each recruitment of a value recalculated the centroid average until all values have been assigned a cluster.
+
+
+Volcano plots to visualise contrasts: changes in protein expression in one condition to another. x-axis = protein expression (contrast lfc), y-axis = p-value
+```{r}
+plot_volcano(dep, contrast = "Ubi6__vs_Ctrl_", label_size = 2)
+
+#or select an individual protein:
+plot_single(dep, proteins = "USP15", type = "centered")
+
+#or visualise overall which proteins had significant protein expression + overlaps/similarities in proteins:
+plot_cond(dep)
+```
+
